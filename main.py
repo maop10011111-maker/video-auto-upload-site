@@ -5,6 +5,7 @@ import mimetypes
 import tempfile
 import requests
 import subprocess
+import re
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -285,7 +286,43 @@ def validate_metadata(metadata):
     }
 
 
-def analyze_video(video_file):
+def fallback_metadata(filename):
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    stem = re.sub(r"(?i)^copy\s+of\s+", "", stem)
+    stem = re.sub(r"[_\-.]+", " ", stem)
+    stem = re.sub(r"\b\d{4,}\b", " ", stem)
+    stem = re.sub(r"\b[a-zA-Z]*\d+[a-zA-Z0-9]*\b", " ", stem)
+    stem = re.sub(r"\s+", " ", stem).strip()
+
+    words = [w for w in stem.split() if len(w) > 1][:6]
+    if words:
+        topic = " ".join(words).title()
+        topic = topic.replace("Ai", "AI")
+        title = f"{topic} | #Shorts"[:95]
+        description = f"A quick short featuring {topic.lower()}. Watch till the end."
+        topic_tags = ["#Shorts", "#ShortVideo"]
+        for word in words[:3]:
+            tag = re.sub(r"[^A-Za-z0-9]", "", word)
+            if tag:
+                topic_tags.append("#" + tag)
+        tags = ["shorts", "short video"] + words
+    else:
+        title = "Creative Short Video | #Shorts"
+        description = "A quick short video made for fast, entertaining viewing. Watch till the end."
+        topic_tags = ["#Shorts", "#ShortVideo", "#Trending"]
+        tags = ["shorts", "short video", "vertical video"]
+
+    print("Using safe local metadata fallback; raw filename will NOT be used.")
+    return {
+        "title": title,
+        "description": description,
+        "hashtags": topic_tags[:5],
+        "tags": tags[:12],
+        "category_id": "22",
+    }
+
+
+def analyze_video(video_file, source_filename):
     prompt = """
 Watch the COMPLETE video carefully and create the final YouTube Shorts upload material.
 
@@ -313,7 +350,8 @@ Rules:
     file_uri = video_file.get("uri")
     mime_type = video_file.get("mimeType") or "video/mp4"
     if not file_uri:
-        raise RuntimeError("Gemini file URI missing.")
+        print("Gemini file URI missing; switching to safe local metadata fallback.")
+        return fallback_metadata(source_filename)
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -333,14 +371,20 @@ Rules:
     }
 
     last_error = None
-    for attempt in range(1, 6):
+    for attempt in range(1, 4):
         try:
-            print(f"Gemini metadata attempt {attempt}/5...")
+            print(f"Gemini metadata attempt {attempt}/3...")
             response = requests.post(url, json=payload, timeout=180)
-            if response.status_code in {429, 500, 502, 503, 504}:
+
+            if response.status_code == 429:
+                print("Gemini quota/rate limit reached (429). Using safe local metadata fallback.")
+                return fallback_metadata(source_filename)
+
+            if response.status_code in {500, 502, 503, 504}:
                 raise RuntimeError(
                     f"Temporary Gemini error {response.status_code}: {response.text[:300]}"
                 )
+
             response.raise_for_status()
             result = response.json()
             text = result["candidates"][0]["content"]["parts"][0]["text"]
@@ -348,12 +392,11 @@ Rules:
         except Exception as error:
             last_error = error
             print("Gemini metadata attempt failed:", error)
-            if attempt < 5:
+            if attempt < 3:
                 time.sleep(8 * attempt)
 
-    raise RuntimeError(
-        f"Could not generate YouTube title/description/hashtags after 5 attempts: {last_error}"
-    )
+    print("Gemini metadata unavailable after retries:", last_error)
+    return fallback_metadata(source_filename)
 
 
 def prepare_metadata(metadata):
@@ -478,12 +521,17 @@ def main():
         print("Validating original video without changing it...")
         video_path = validate_original_video(original_path)
 
-        print("Sending original-duration video to Gemini...")
-        gemini_file = upload_to_gemini(video_path)
-        gemini_file = wait_for_gemini_file(gemini_file)
+        try:
+            print("Sending original-duration video to Gemini...")
+            gemini_file = upload_to_gemini(video_path)
+            gemini_file = wait_for_gemini_file(gemini_file)
+            metadata_source = gemini_file
+        except Exception as error:
+            print("Gemini file processing unavailable:", error)
+            metadata_source = {}
 
         print("Generating YouTube title, description, hashtags and tags...")
-        metadata = prepare_metadata(analyze_video(gemini_file))
+        metadata = prepare_metadata(analyze_video(metadata_source, video["name"]))
         print("Generated title:", metadata["title"])
         print("Generated description/hashtags ready.")
         print("Final upload duration:", f"{probe_duration(video_path):.2f}s")
