@@ -98,9 +98,35 @@ jobs:
           UPLOADED_FOLDER_ID: ${{ secrets.UPLOADED_FOLDER_ID }}
         run: |
           set +e
-          python main.py 2>&1 | tee youtube_run.log
-          status=${PIPESTATUS[0]}
-          if [ "$status" -ne 0 ]; then exit "$status"; fi
+          : > youtube_run.log
+          status=1
+
+          for attempt in 1 2 3; do
+            echo "YouTube automation attempt ${attempt}/3"
+            : > youtube_attempt.log
+            python main.py 2>&1 | tee youtube_attempt.log | tee -a youtube_run.log
+            status=${PIPESTATUS[0]}
+
+            if [ "$status" -eq 0 ]; then
+              break
+            fi
+
+            if grep -q "Could not obtain a complete valid video from Drive" youtube_attempt.log && [ "$attempt" -lt 3 ]; then
+              wait_seconds=$((attempt * 45))
+              echo "Drive returned a temporary/partial copy. Waiting ${wait_seconds}s before a fresh download attempt..." | tee -a youtube_run.log
+              sleep "$wait_seconds"
+              continue
+            fi
+
+            break
+          done
+
+          rm -f youtube_attempt.log
+
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+
           if grep -q "YouTube upload successful." youtube_run.log; then
             echo "uploaded=true" >> "$GITHUB_OUTPUT"
           elif grep -q "No videos found in READY folder." youtube_run.log; then
