@@ -2,16 +2,14 @@ name: YouTube Auto Upload
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
   schedule:
-    # Target times IST: 8 AM, 10 AM, 12 PM, 2 PM, 4 PM, 6 PM, 8 PM, 10 PM.
-    # GitHub cron is UTC. Primary attempt at target time, retries at +5, +10, +15 minutes.
-    - cron: "30 2,4,6,8,10,12,14,16 * * *"
-    - cron: "35 2,4,6,8,10,12,14,16 * * *"
-    - cron: "40 2,4,6,8,10,12,14,16 * * *"
-    - cron: "45 2,4,6,8,10,12,14,16 * * *"
+    # YouTube: ONLY 2 uploads/day — 2 PM and 8 PM IST.
+    # GitHub cron uses UTC. Primary attempts are 08:30 and 14:30 UTC.
+    # Retry opportunities follow at +5, +10 and +15 minutes.
+    - cron: "30 8,14 * * *"
+    - cron: "35 8,14 * * *"
+    - cron: "40 8,14 * * *"
+    - cron: "45 8,14 * * *"
 
 concurrency:
   group: youtube-auto-upload
@@ -19,8 +17,6 @@ concurrency:
 
 jobs:
   upload:
-    # Normal code pushes do not upload. This exact commit is also our immediate test trigger.
-    if: github.event_name != 'push' || github.event.head_commit.message == 'Trigger YouTube upload now'
     runs-on: ubuntu-latest
 
     steps:
@@ -36,16 +32,16 @@ jobs:
           event = os.environ.get("GITHUB_EVENT_NAME", "")
           run_id = os.environ.get("GITHUB_RUN_ID", "manual")
 
-          if event in ("workflow_dispatch", "push"):
+          if event == "workflow_dispatch":
               with open(output, "a", encoding="utf-8") as f:
                   f.write("due=true\n")
                   f.write(f"slot=manual-{run_id}\n")
-              print("Immediate YouTube upload allowed.")
+              print("Manual YouTube upload allowed.")
               raise SystemExit(0)
 
           ist = timezone(timedelta(hours=5, minutes=30))
           now = datetime.now(timezone.utc).astimezone(ist)
-          target_hours = {8, 10, 12, 14, 16, 18, 20, 22}
+          target_hours = {14, 20}
 
           if now.hour in target_hours:
               slot_hour = now.hour
