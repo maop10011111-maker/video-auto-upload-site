@@ -171,38 +171,26 @@ def probe_duration(path):
     return float(value) if value else 0.0
 
 
-def normalize_video(input_path):
-    source_duration = probe_duration(input_path)
-    print(f"Source duration detected: {source_duration:.2f} seconds")
-    if source_duration < 2.0:
+def validate_original_video(input_path):
+    duration = probe_duration(input_path)
+    print(f"Original video duration: {duration:.2f} seconds")
+    if duration < 2.0:
         raise RuntimeError(
-            f"Source video duration is only {source_duration:.2f}s. Refusing to upload a broken/partial file."
+            f"Source video duration is only {duration:.2f}s. Refusing to upload a broken/partial file."
         )
 
-    output_path = os.path.join(os.path.dirname(input_path), "youtube_normalized.mp4")
-    command = [
-        "ffmpeg", "-y", "-fflags", "+genpts", "-i", input_path,
-        "-map", "0:v:0", "-map", "0:a?",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-fps_mode", "cfr", "-r", "30",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-        "-movflags", "+faststart", "-avoid_negative_ts", "make_zero",
-        output_path,
-    ]
-    process = subprocess.run(command, capture_output=True, text=True)
-    if process.returncode != 0:
-        print(process.stderr)
-        raise RuntimeError("FFmpeg normalization failed.")
-
-    normalized_duration = probe_duration(output_path)
-    print(f"Normalized duration: {normalized_duration:.2f} seconds")
-    if normalized_duration < 2.0:
-        raise RuntimeError("Normalized video is still too short; upload stopped for safety.")
-    if abs(normalized_duration - source_duration) > max(2.0, source_duration * 0.20):
+    decode_check = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", input_path, "-map", "0:v:0", "-f", "null", "-"],
+        capture_output=True,
+        text=True,
+    )
+    if decode_check.returncode != 0:
         raise RuntimeError(
-            f"Duration changed unexpectedly from {source_duration:.2f}s to {normalized_duration:.2f}s; upload stopped."
+            "Original video failed decode validation: " + decode_check.stderr[-1000:]
         )
-    return output_path
+
+    print("Original video validated. No re-encoding will be done, so duration is preserved.")
+    return input_path
 
 
 def upload_to_gemini(video_path):
@@ -424,8 +412,9 @@ def upload_to_youtube(youtube, video_path, metadata):
             "selfDeclaredMadeForKids": False,
         },
     }
+    mime_type = mimetypes.guess_type(video_path)[0] or "video/mp4"
     media = MediaFileUpload(
-        video_path, mimetype="video/mp4", chunksize=8 * 1024 * 1024, resumable=True
+        video_path, mimetype=mime_type, chunksize=8 * 1024 * 1024, resumable=True
     )
     request = youtube.videos().insert(
         part="snippet,status",
@@ -486,10 +475,10 @@ def main():
         original_path = download_video(
             drive, video["id"], video["name"], video.get("size")
         )
-        print("Validating and normalizing video timing...")
-        video_path = normalize_video(original_path)
+        print("Validating original video without changing it...")
+        video_path = validate_original_video(original_path)
 
-        print("Sending normalized video to Gemini...")
+        print("Sending original-duration video to Gemini...")
         gemini_file = upload_to_gemini(video_path)
         gemini_file = wait_for_gemini_file(gemini_file)
 
@@ -497,9 +486,9 @@ def main():
         metadata = prepare_metadata(analyze_video(gemini_file))
         print("Generated title:", metadata["title"])
         print("Generated description/hashtags ready.")
-        print("Final verified duration before upload:", f"{probe_duration(video_path):.2f}s")
+        print("Final upload duration:", f"{probe_duration(video_path):.2f}s")
 
-        print("Uploading Short to YouTube with requested privacyStatus=public...")
+        print("Uploading original video to YouTube with requested privacyStatus=public...")
         youtube_video = upload_to_youtube(youtube, video_path, metadata)
         video_id = youtube_video["id"]
         print("YouTube upload API completed.")
