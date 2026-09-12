@@ -18,6 +18,7 @@ concurrency:
 jobs:
   upload:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Determine posting slot
         id: slot
@@ -60,8 +61,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-          ffmpeg -version
-          ffprobe -version
+          command -v ffmpeg
+          command -v ffprobe
       - name: Install dependencies
         if: steps.slot.outputs.due == 'true' && steps.slot_cache.outputs.cache-hit != 'true'
         run: pip install -r requirements.txt
@@ -81,7 +82,15 @@ jobs:
           python main.py 2>&1 | tee youtube_run.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then exit "$status"; fi
-          if grep -q "YouTube upload successful." youtube_run.log; then echo "uploaded=true" >> "$GITHUB_OUTPUT"; else echo "uploaded=false" >> "$GITHUB_OUTPUT"; fi
+          if grep -q "YouTube upload successful." youtube_run.log; then
+            echo "uploaded=true" >> "$GITHUB_OUTPUT"
+          elif grep -q "No videos found in READY folder." youtube_run.log; then
+            echo "uploaded=false" >> "$GITHUB_OUTPUT"
+            echo "READY folder is empty; nothing to upload."
+          else
+            echo "YouTube automation ended without confirmed upload or empty-folder result."
+            exit 1
+          fi
       - name: Mark posting slot complete
         if: steps.run.outputs.uploaded == 'true'
         run: echo "${{ steps.slot.outputs.slot }}" > .youtube-slot-marker
