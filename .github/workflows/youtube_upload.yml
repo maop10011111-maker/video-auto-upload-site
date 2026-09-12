@@ -1,6 +1,8 @@
 name: YouTube Auto Upload
 
 on:
+  repository_dispatch:
+    types: [telegram_youtube]
   push:
     branches: [main]
     paths:
@@ -35,6 +37,11 @@ jobs:
           event=os.getenv("EVENT_NAME","")
           message=os.getenv("COMMIT_MESSAGE","")
           run_id=os.getenv("RUN_ID","")
+          if event == "repository_dispatch":
+              with open(output,"a",encoding="utf-8") as f:
+                  f.write("due=true\n")
+                  f.write(f"slot=telegram-{run_id}\n")
+              raise SystemExit(0)
           if event == "push" and "One-time immediate YouTube upload" in message:
               with open(output,"a",encoding="utf-8") as f:
                   f.write("due=true\n")
