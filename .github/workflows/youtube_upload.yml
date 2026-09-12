@@ -3,15 +3,6 @@ name: YouTube Auto Upload
 on:
   repository_dispatch:
     types: [telegram_youtube]
-  push:
-    branches: [main]
-    paths:
-      - ".automation/youtube-trigger.txt"
-  schedule:
-    - cron: "30 8,14 * * *"
-    - cron: "35 8,14 * * *"
-    - cron: "40 8,14 * * *"
-    - cron: "45 8,14 * * *"
 
 concurrency:
   group: youtube-auto-upload
@@ -21,73 +12,45 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
-      - name: Determine posting slot
+      - name: Set Telegram trigger slot
         id: slot
         shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-          RUN_ID: ${{ github.run_id }}
         run: |
-          python - <<'PY'
-          import os
-          from datetime import datetime, timezone, timedelta
-          output=os.environ["GITHUB_OUTPUT"]
-          event=os.getenv("EVENT_NAME","")
-          message=os.getenv("COMMIT_MESSAGE","")
-          run_id=os.getenv("RUN_ID","")
-          if event == "repository_dispatch":
-              with open(output,"a",encoding="utf-8") as f:
-                  f.write("due=true\n")
-                  f.write(f"slot=telegram-{run_id}\n")
-              raise SystemExit(0)
-          if event == "push" and "One-time immediate YouTube upload" in message:
-              with open(output,"a",encoding="utf-8") as f:
-                  f.write("due=true\n")
-                  f.write(f"slot=one-time-{run_id}\n")
-              raise SystemExit(0)
-          ist=timezone(timedelta(hours=5,minutes=30))
-          now=datetime.now(timezone.utc).astimezone(ist)
-          target_hours={14,20}
-          if now.hour in target_hours: slot_hour=now.hour
-          elif (now.hour-1) in target_hours: slot_hour=now.hour-1
-          else:
-              with open(output,"a",encoding="utf-8") as f: f.write("due=false\nslot=none\n")
-              raise SystemExit(0)
-          slot=f"{now:%Y-%m-%d}-{slot_hour:02d}"
-          with open(output,"a",encoding="utf-8") as f:
-              f.write("due=true\n")
-              f.write(f"slot={slot}\n")
-          PY
+          echo "slot=telegram-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout repository
-        if: steps.slot.outputs.due == 'true'
         uses: actions/checkout@v4
-      - name: Check whether this slot already uploaded
+
+      - name: Check whether this command already uploaded
         id: slot_cache
-        if: steps.slot.outputs.due == 'true'
         uses: actions/cache/restore@v4
         with:
           path: .youtube-slot-marker
           key: youtube-slot-${{ steps.slot.outputs.slot }}
+
       - name: Set up Python
-        if: steps.slot.outputs.due == 'true' && steps.slot_cache.outputs.cache-hit != 'true'
+        if: steps.slot_cache.outputs.cache-hit != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install FFmpeg
-        if: steps.slot.outputs.due == 'true' && steps.slot_cache.outputs.cache-hit != 'true'
+        if: steps.slot_cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           command -v ffmpeg
           command -v ffprobe
+
       - name: Install dependencies
-        if: steps.slot.outputs.due == 'true' && steps.slot_cache.outputs.cache-hit != 'true'
+        if: steps.slot_cache.outputs.cache-hit != 'true'
         run: pip install -r requirements.txt
+
       - name: Run YouTube automation
         id: run
-        if: steps.slot.outputs.due == 'true' && steps.slot_cache.outputs.cache-hit != 'true'
+        if: steps.slot_cache.outputs.cache-hit != 'true'
         shell: bash
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -136,15 +99,18 @@ jobs:
             echo "YouTube automation ended without confirmed upload or empty-folder result."
             exit 1
           fi
-      - name: Mark posting slot complete
+
+      - name: Mark Telegram command complete
         if: steps.run.outputs.uploaded == 'true'
         run: echo "${{ steps.slot.outputs.slot }}" > .youtube-slot-marker
-      - name: Save completed posting slot
+
+      - name: Save completed Telegram command
         if: steps.run.outputs.uploaded == 'true'
         uses: actions/cache/save@v4
         with:
           path: .youtube-slot-marker
           key: youtube-slot-${{ steps.slot.outputs.slot }}
-      - name: Slot already completed
-        if: steps.slot.outputs.due == 'true' && steps.slot_cache.outputs.cache-hit == 'true'
-        run: echo "This YouTube posting slot already succeeded."
+
+      - name: Command already completed
+        if: steps.slot_cache.outputs.cache-hit == 'true'
+        run: echo "This Telegram-triggered YouTube command already succeeded."
