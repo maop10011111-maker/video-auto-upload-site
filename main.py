@@ -22,6 +22,10 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
 ]
 
+LEGACY_ALREADY_UPLOADED = {
+    "ankitaistudio14_AQNuk7Z_c_9AZ-4KvZ3oQSW3_1787745623433.mp4": "fyBYm80DVkI",
+}
+
 
 def google_credentials():
     creds = Credentials(
@@ -36,18 +40,65 @@ def google_credentials():
     return creds
 
 
+def is_video(file):
+    mime = file.get("mimeType", "")
+    name = file.get("name", "").lower()
+    return mime.startswith("video/") or name.endswith(
+        (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v")
+    )
+
+
+def mark_youtube_uploaded(drive, file_id, video_id):
+    drive.files().update(
+        fileId=file_id,
+        body={
+            "appProperties": {
+                "youtube_uploaded": "true",
+                "youtube_video_id": str(video_id),
+            }
+        },
+        fields="id,appProperties",
+    ).execute()
+    print("Drive source marked as already uploaded to YouTube.")
+
+
+def delete_stale_uploaded_source(drive, file):
+    try:
+        drive.files().delete(fileId=file["id"]).execute()
+        print("Removed stale already-uploaded source from READY:", file["name"])
+    except Exception as error:
+        print("Could not remove stale already-uploaded source:", error)
+
+
 def get_next_video(drive):
     response = drive.files().list(
         q=f"'{READY_FOLDER_ID}' in parents and trashed = false",
         orderBy="createdTime asc",
         pageSize=100,
-        fields="files(id,name,mimeType,size,parents)",
+        fields="files(id,name,mimeType,size,parents,appProperties)",
     ).execute()
+
     for file in response.get("files", []):
-        mime = file.get("mimeType", "")
-        name = file.get("name", "").lower()
-        if mime.startswith("video/") or name.endswith((".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v")):
-            return file
+        if not is_video(file):
+            continue
+
+        props = file.get("appProperties") or {}
+        if props.get("youtube_uploaded") == "true":
+            print("Skipping file already marked uploaded to YouTube:", file["name"])
+            delete_stale_uploaded_source(drive, file)
+            continue
+
+        legacy_video_id = LEGACY_ALREADY_UPLOADED.get(file.get("name"))
+        if legacy_video_id:
+            print("Skipping previously confirmed YouTube upload:", file["name"])
+            try:
+                mark_youtube_uploaded(drive, file["id"], legacy_video_id)
+            finally:
+                delete_stale_uploaded_source(drive, file)
+            continue
+
+        return file
+
     return None
 
 
@@ -74,7 +125,9 @@ def download_video(drive, file_id, filename, expected_size=None):
             if actual <= 0:
                 raise RuntimeError("Downloaded video is empty.")
             if expected is not None and actual != expected:
-                raise RuntimeError(f"Drive download size mismatch: expected {expected} bytes, got {actual} bytes.")
+                raise RuntimeError(
+                    f"Drive download size mismatch: expected {expected} bytes, got {actual} bytes."
+                )
 
             check = subprocess.run(
                 ["ffmpeg", "-v", "error", "-i", path, "-map", "0:v:0", "-f", "null", "-"],
@@ -82,8 +135,9 @@ def download_video(drive, file_id, filename, expected_size=None):
                 text=True,
             )
             if check.returncode != 0:
-                raise RuntimeError("Downloaded video failed decode validation: " + check.stderr[-1000:])
-
+                raise RuntimeError(
+                    "Downloaded video failed decode validation: " + check.stderr[-1000:]
+                )
             return path
         except Exception as error:
             last_error = error
@@ -96,7 +150,9 @@ def download_video(drive, file_id, filename, expected_size=None):
             if attempt < 3:
                 time.sleep(3 * attempt)
 
-    raise RuntimeError(f"Could not obtain a complete valid video from Drive after 3 attempts: {last_error}")
+    raise RuntimeError(
+        f"Could not obtain a complete valid video from Drive after 3 attempts: {last_error}"
+    )
 
 
 def probe_duration(path):
@@ -118,7 +174,6 @@ def probe_duration(path):
 def normalize_video(input_path):
     source_duration = probe_duration(input_path)
     print(f"Source duration detected: {source_duration:.2f} seconds")
-
     if source_duration < 2.0:
         raise RuntimeError(
             f"Source video duration is only {source_duration:.2f}s. Refusing to upload a broken/partial file."
@@ -126,22 +181,12 @@ def normalize_video(input_path):
 
     output_path = os.path.join(os.path.dirname(input_path), "youtube_normalized.mp4")
     command = [
-        "ffmpeg", "-y",
-        "-fflags", "+genpts",
-        "-i", input_path,
-        "-map", "0:v:0",
-        "-map", "0:a?",
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        "-fps_mode", "cfr",
-        "-r", "30",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-ar", "48000",
-        "-movflags", "+faststart",
-        "-avoid_negative_ts", "make_zero",
+        "ffmpeg", "-y", "-fflags", "+genpts", "-i", input_path,
+        "-map", "0:v:0", "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-fps_mode", "cfr", "-r", "30",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart", "-avoid_negative_ts", "make_zero",
         output_path,
     ]
     process = subprocess.run(command, capture_output=True, text=True)
@@ -163,9 +208,13 @@ def normalize_video(input_path):
 def upload_to_gemini(video_path):
     file_size = os.path.getsize(video_path)
     if file_size > 2_000_000_000:
-        raise Exception("Video is larger than Gemini file limit.")
+        raise RuntimeError("Video is larger than Gemini file limit.")
+
     mime_type = mimetypes.guess_type(video_path)[0] or "video/mp4"
-    start_url = "https://generativelanguage.googleapis.com/" + f"upload/v1beta/files?key={GEMINI_API_KEY}"
+    start_url = (
+        "https://generativelanguage.googleapis.com/"
+        f"upload/v1beta/files?key={GEMINI_API_KEY}"
+    )
     metadata = {"file": {"display_name": os.path.basename(video_path)}}
     headers = {
         "X-Goog-Upload-Protocol": "resumable",
@@ -178,14 +227,17 @@ def upload_to_gemini(video_path):
     start.raise_for_status()
     upload_url = start.headers.get("X-Goog-Upload-URL")
     if not upload_url:
-        raise Exception("Gemini did not return upload URL.")
+        raise RuntimeError("Gemini did not return upload URL.")
+
     upload_headers = {
         "Content-Length": str(file_size),
         "X-Goog-Upload-Offset": "0",
         "X-Goog-Upload-Command": "upload, finalize",
     }
     with open(video_path, "rb") as video_file:
-        uploaded = requests.post(upload_url, headers=upload_headers, data=video_file, timeout=300)
+        uploaded = requests.post(
+            upload_url, headers=upload_headers, data=video_file, timeout=300
+        )
     uploaded.raise_for_status()
     return uploaded.json().get("file", uploaded.json())
 
@@ -193,9 +245,12 @@ def upload_to_gemini(video_path):
 def wait_for_gemini_file(file_info):
     name = file_info.get("name")
     if not name:
-        return file_info
-    url = "https://generativelanguage.googleapis.com/" + f"v1beta/{name}?key={GEMINI_API_KEY}"
-    for _ in range(30):
+        raise RuntimeError("Gemini file name missing.")
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/{name}?key={GEMINI_API_KEY}"
+    )
+    for _ in range(45):
         response = requests.get(url, timeout=30)
         response.raise_for_status()
         info = response.json()
@@ -207,50 +262,131 @@ def wait_for_gemini_file(file_info):
             return info
         if state == "FAILED":
             raise RuntimeError("Gemini video processing failed.")
-        time.sleep(2)
+        time.sleep(3)
     raise RuntimeError("Gemini processing timed out.")
 
 
-def analyze_video(file_info):
-    prompt = "Return JSON only with title, description, hashtags, tags, category_id for this YouTube Short. Keep title under 95 chars and use relevant metadata only."
-    file_uri = file_info.get("uri")
+def clean_json(text):
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+
+def validate_metadata(metadata):
+    title = str(metadata.get("title", "")).strip()
+    description = str(metadata.get("description", "")).strip()
+    hashtags = metadata.get("hashtags", [])
+    tags = metadata.get("tags", [])
+    if not title or len(title) < 3:
+        raise RuntimeError("Gemini returned an empty/invalid YouTube title.")
+    if not isinstance(hashtags, list):
+        hashtags = []
+    if not isinstance(tags, list):
+        tags = []
+    return {
+        "title": title,
+        "description": description,
+        "hashtags": hashtags,
+        "tags": tags,
+        "category_id": str(metadata.get("category_id", "22")),
+    }
+
+
+def analyze_video(video_file):
+    prompt = """
+Watch the COMPLETE video carefully and create the final YouTube Shorts upload material.
+
+Return ONLY valid JSON:
+{
+  "title": "natural high-quality YouTube Shorts title",
+  "description": "2-5 concise natural lines describing what actually happens in the video",
+  "hashtags": ["#Shorts", "#RelevantTag2", "#RelevantTag3"],
+  "tags": ["shorts", "relevant keyword", "another keyword"],
+  "category_id": "22"
+}
+
+Rules:
+- Base everything ONLY on the actual video.
+- Detect the spoken/written language. Use natural Hinglish for Hindi/Hinglish content; use English for English content.
+- Title must be human, clean, interesting, and under 95 characters.
+- Do NOT use the source filename, random IDs, usernames, timestamps, or file codes as the title.
+- Do NOT mention AI or that metadata was generated.
+- Description must not be blank.
+- Use 3-5 relevant hashtags and 5-12 relevant tags.
+- No fake claims or invented people/brands.
+- JSON only. No markdown.
+""".strip()
+
+    file_uri = video_file.get("uri")
+    mime_type = video_file.get("mimeType") or "video/mp4"
     if not file_uri:
         raise RuntimeError("Gemini file URI missing.")
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + GEMINI_API_KEY
-    payload = {"contents": [{"parts": [{"text": prompt}, {"fileData": {"mimeType": "video/mp4", "fileUri": file_uri}}]}]}
-    response = requests.post(url, json=payload, timeout=180)
-    response.raise_for_status()
-    text = response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
-    return json.loads(text)
 
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [{
+            "parts": [
+                {"fileData": {"mimeType": mime_type, "fileUri": file_uri}},
+                {"text": prompt},
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0.55,
+            "responseMimeType": "application/json",
+        },
+    }
 
-def fallback_metadata(filename):
-    name = os.path.splitext(os.path.basename(filename))[0].replace("_", " ").replace("-", " ")
-    return {"title": name[:95] or "New Short", "description": "", "hashtags": ["Shorts"], "tags": ["shorts"], "category_id": "22"}
+    last_error = None
+    for attempt in range(1, 6):
+        try:
+            print(f"Gemini metadata attempt {attempt}/5...")
+            response = requests.post(url, json=payload, timeout=180)
+            if response.status_code in {429, 500, 502, 503, 504}:
+                raise RuntimeError(
+                    f"Temporary Gemini error {response.status_code}: {response.text[:300]}"
+                )
+            response.raise_for_status()
+            result = response.json()
+            text = result["candidates"][0]["content"]["parts"][0]["text"]
+            return validate_metadata(json.loads(clean_json(text)))
+        except Exception as error:
+            last_error = error
+            print("Gemini metadata attempt failed:", error)
+            if attempt < 5:
+                time.sleep(8 * attempt)
+
+    raise RuntimeError(
+        f"Could not generate YouTube title/description/hashtags after 5 attempts: {last_error}"
+    )
 
 
 def prepare_metadata(metadata):
-    title = str(metadata.get("title", "New Short")).strip()[:95]
+    title = str(metadata["title"]).strip()[:95]
     description = str(metadata.get("description", "")).strip()
-    hashtags = metadata.get("hashtags", [])
-    if isinstance(hashtags, list):
-        cleaned = []
-        for tag in hashtags[:5]:
-            tag = str(tag).strip()
-            if tag:
-                if not tag.startswith("#"):
-                    tag = "#" + tag.replace(" ", "")
-                cleaned.append(tag)
-        if cleaned:
-            description += "\n\n" + " ".join(cleaned)
-    tags = metadata.get("tags", []) if isinstance(metadata.get("tags", []), list) else []
+
+    clean_hashtags = []
+    for tag in metadata.get("hashtags", [])[:5]:
+        tag = str(tag).strip()
+        if not tag:
+            continue
+        if not tag.startswith("#"):
+            tag = "#" + tag.replace(" ", "")
+        clean_hashtags.append(tag)
+
+    if clean_hashtags:
+        description = (description + "\n\n" + " ".join(clean_hashtags)).strip()
+
     final_tags = []
     total = 0
-    for tag in tags:
+    for tag in metadata.get("tags", []):
         tag = str(tag).strip()
         if not tag:
             continue
@@ -258,11 +394,21 @@ def prepare_metadata(metadata):
             break
         final_tags.append(tag)
         total += len(tag)
+
     allowed = {"1","2","10","15","17","19","20","22","23","24","25","26","27","28"}
     category_id = str(metadata.get("category_id", "22"))
     if category_id not in allowed:
         category_id = "22"
-    return {"title": title, "description": description[:5000], "tags": final_tags, "category_id": category_id}
+
+    if not title or not description:
+        raise RuntimeError("Generated YouTube upload material is incomplete; upload stopped.")
+
+    return {
+        "title": title,
+        "description": description[:5000],
+        "tags": final_tags,
+        "category_id": category_id,
+    }
 
 
 def upload_to_youtube(youtube, video_path, metadata):
@@ -273,10 +419,20 @@ def upload_to_youtube(youtube, video_path, metadata):
             "tags": metadata["tags"],
             "categoryId": metadata["category_id"],
         },
-        "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
+        "status": {
+            "privacyStatus": "public",
+            "selfDeclaredMadeForKids": False,
+        },
     }
-    media = MediaFileUpload(video_path, mimetype="video/mp4", chunksize=8 * 1024 * 1024, resumable=True)
-    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media, notifySubscribers=False)
+    media = MediaFileUpload(
+        video_path, mimetype="video/mp4", chunksize=8 * 1024 * 1024, resumable=True
+    )
+    request = youtube.videos().insert(
+        part="snippet,status",
+        body=body,
+        media_body=media,
+        notifySubscribers=False,
+    )
     response = None
     while response is None:
         status, response = request.next_chunk(num_retries=5)
@@ -287,24 +443,24 @@ def upload_to_youtube(youtube, video_path, metadata):
 
 def verify_youtube_upload_response(upload_response):
     privacy = upload_response.get("status", {}).get("privacyStatus")
-    print(f"YouTube upload response privacy: {privacy}")
+    print("YouTube upload response privacy:", privacy)
     if privacy != "public":
         raise RuntimeError(
-            "YouTube accepted the upload but did not return privacyStatus=public. "
-            "The API project may be subject to YouTube's private-upload restriction."
+            "YouTube accepted the upload but did not return privacyStatus=public."
         )
 
 
 def delete_from_drive(drive, file_id):
-    print("YouTube upload confirmed public.")
-    print("Deleting original video from Google Drive...")
     drive.files().delete(fileId=file_id).execute()
     print("Original video permanently deleted from Google Drive.")
 
 
 def delete_gemini_file(file_info):
     try:
-        url = "https://generativelanguage.googleapis.com/" + f"v1beta/{file_info['name']}?key={GEMINI_API_KEY}"
+        url = (
+            "https://generativelanguage.googleapis.com/"
+            f"v1beta/{file_info['name']}?key={GEMINI_API_KEY}"
+        )
         requests.delete(url, timeout=30)
     except Exception as error:
         print("Could not delete Gemini temporary file:", error)
@@ -322,47 +478,58 @@ def main():
         return
 
     print("Selected video:", video["name"])
-    original_path = download_video(drive, video["id"], video["name"], video.get("size"))
-    print("Validating and normalizing video timing...")
-    video_path = normalize_video(original_path)
+    original_path = None
+    video_path = None
     gemini_file = None
 
     try:
+        original_path = download_video(
+            drive, video["id"], video["name"], video.get("size")
+        )
+        print("Validating and normalizing video timing...")
+        video_path = normalize_video(original_path)
+
         print("Sending normalized video to Gemini...")
         gemini_file = upload_to_gemini(video_path)
         gemini_file = wait_for_gemini_file(gemini_file)
-        print("Generating Shorts metadata...")
-        metadata = analyze_video(gemini_file)
-    except Exception as error:
-        print("Gemini analysis failed:", error)
-        print("Using fallback metadata.")
-        metadata = fallback_metadata(video["name"])
 
-    metadata = prepare_metadata(metadata)
-    print("Generated title:", metadata["title"])
-    print("Final verified duration before upload:", f"{probe_duration(video_path):.2f}s")
-    print("Uploading Short to YouTube with requested privacyStatus=public...")
+        print("Generating YouTube title, description, hashtags and tags...")
+        metadata = prepare_metadata(analyze_video(gemini_file))
+        print("Generated title:", metadata["title"])
+        print("Generated description/hashtags ready.")
+        print("Final verified duration before upload:", f"{probe_duration(video_path):.2f}s")
 
-    youtube_video = upload_to_youtube(youtube, video_path, metadata)
-    video_id = youtube_video["id"]
-    print("YouTube upload API completed.")
-    print("YouTube Video ID:", video_id)
-    verify_youtube_upload_response(youtube_video)
-    print("YouTube upload successful.")
-    print("YouTube privacy verified from upload response: public")
+        print("Uploading Short to YouTube with requested privacyStatus=public...")
+        youtube_video = upload_to_youtube(youtube, video_path, metadata)
+        video_id = youtube_video["id"]
+        print("YouTube upload API completed.")
+        print("YouTube Video ID:", video_id)
 
-    delete_from_drive(drive, video["id"])
+        mark_youtube_uploaded(drive, video["id"], video_id)
 
-    if gemini_file:
-        delete_gemini_file(gemini_file)
+        verify_youtube_upload_response(youtube_video)
+        print("YouTube upload successful.")
+        print("YouTube privacy verified from upload response: public")
 
-    for path in {original_path, video_path}:
         try:
-            os.remove(path)
-        except Exception:
-            pass
+            delete_from_drive(drive, video["id"])
+        except Exception as error:
+            print(
+                "Drive delete warning: source could not be deleted, but it is marked "
+                "youtube_uploaded=true so it will NOT be uploaded again:",
+                error,
+            )
 
-    print("Automation completed successfully.")
+        print("Automation completed successfully.")
+    finally:
+        if gemini_file:
+            delete_gemini_file(gemini_file)
+        for path in {original_path, video_path}:
+            if path:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
