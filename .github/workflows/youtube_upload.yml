@@ -23,11 +23,23 @@ jobs:
       - name: Determine posting slot
         id: slot
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           python - <<'PY'
           import os
           from datetime import datetime, timezone, timedelta
           output=os.environ["GITHUB_OUTPUT"]
+          event=os.getenv("EVENT_NAME","")
+          message=os.getenv("COMMIT_MESSAGE","")
+          run_id=os.getenv("RUN_ID","")
+          if event == "push" and "One-time immediate YouTube upload" in message:
+              with open(output,"a",encoding="utf-8") as f:
+                  f.write("due=true\n")
+                  f.write(f"slot=one-time-{run_id}\n")
+              raise SystemExit(0)
           ist=timezone(timedelta(hours=5,minutes=30))
           now=datetime.now(timezone.utc).astimezone(ist)
           target_hours={14,20}
