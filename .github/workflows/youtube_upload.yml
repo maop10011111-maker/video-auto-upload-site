@@ -1,10 +1,10 @@
 name: YouTube Auto Upload
 
 on:
+  push:
+    branches:
+      - main
   schedule:
-    # YouTube: ONLY 2 uploads/day — 2 PM and 8 PM IST.
-    # GitHub cron uses UTC. Primary attempts are 08:30 and 14:30 UTC.
-    # Retry opportunities follow at +5, +10 and +15 minutes.
     - cron: "30 8,14 * * *"
     - cron: "35 8,14 * * *"
     - cron: "40 8,14 * * *"
@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   upload:
+    if: github.event_name != 'push' || github.event.head_commit.message == 'Trigger one-time YouTube upload'
     runs-on: ubuntu-latest
 
     steps:
@@ -26,12 +27,17 @@ jobs:
           python - <<'PY'
           import os
           from datetime import datetime, timezone, timedelta
-
           output = os.environ["GITHUB_OUTPUT"]
+          event = os.environ.get("GITHUB_EVENT_NAME", "")
+          run_id = os.environ.get("GITHUB_RUN_ID", "run")
+          if event == "push":
+              with open(output, "a", encoding="utf-8") as f:
+                  f.write("due=true\n")
+                  f.write(f"slot=one-time-{run_id}\n")
+              raise SystemExit(0)
           ist = timezone(timedelta(hours=5, minutes=30))
           now = datetime.now(timezone.utc).astimezone(ist)
           target_hours = {14, 20}
-
           if now.hour in target_hours:
               slot_hour = now.hour
           elif (now.hour - 1) in target_hours:
@@ -40,14 +46,11 @@ jobs:
               with open(output, "a", encoding="utf-8") as f:
                   f.write("due=false\n")
                   f.write("slot=none\n")
-              print(f"No YouTube slot due now ({now:%Y-%m-%d %H:%M IST}).")
               raise SystemExit(0)
-
           slot = f"{now:%Y-%m-%d}-{slot_hour:02d}"
           with open(output, "a", encoding="utf-8") as f:
               f.write("due=true\n")
               f.write(f"slot={slot}\n")
-          print(f"YouTube slot due: {slot}")
           PY
 
       - name: Checkout repository
@@ -87,9 +90,7 @@ jobs:
           set +e
           python main.py 2>&1 | tee youtube_run.log
           status=${PIPESTATUS[0]}
-          if [ "$status" -ne 0 ]; then
-            exit "$status"
-          fi
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
           if grep -q "YouTube upload successful." youtube_run.log; then
             echo "uploaded=true" >> "$GITHUB_OUTPUT"
           else
@@ -109,4 +110,4 @@ jobs:
 
       - name: Slot already completed
         if: steps.slot.outputs.due == 'true' && steps.slot_cache.outputs.cache-hit == 'true'
-        run: echo "This YouTube posting slot already succeeded, so no duplicate Short will be uploaded."
+        run: echo "This YouTube posting slot already succeeded."
