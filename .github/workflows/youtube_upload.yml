@@ -2,6 +2,16 @@ name: YouTube Auto Upload
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+  schedule:
+    # Target times IST: 8 AM, 10 AM, 12 PM, 2 PM, 4 PM, 6 PM, 8 PM, 10 PM.
+    # GitHub cron is UTC. Primary attempt at target time, retries at +5, +10, +15 minutes.
+    - cron: "30 2,4,6,8,10,12,14,16 * * *"
+    - cron: "35 2,4,6,8,10,12,14,16 * * *"
+    - cron: "40 2,4,6,8,10,12,14,16 * * *"
+    - cron: "45 2,4,6,8,10,12,14,16 * * *"
 
 concurrency:
   group: youtube-auto-upload
@@ -9,21 +19,78 @@ concurrency:
 
 jobs:
   upload:
+    # Normal code pushes do not upload. This exact commit is also our immediate test trigger.
+    if: github.event_name != 'push' || github.event.head_commit.message == 'Trigger YouTube upload now'
     runs-on: ubuntu-latest
 
     steps:
+      - name: Determine posting slot
+        id: slot
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime, timezone, timedelta
+
+          output = os.environ["GITHUB_OUTPUT"]
+          event = os.environ.get("GITHUB_EVENT_NAME", "")
+          run_id = os.environ.get("GITHUB_RUN_ID", "manual")
+
+          if event in ("workflow_dispatch", "push"):
+              with open(output, "a", encoding="utf-8") as f:
+                  f.write("due=true\n")
+                  f.write(f"slot=manual-{run_id}\n")
+              print("Immediate YouTube upload allowed.")
+              raise SystemExit(0)
+
+          ist = timezone(timedelta(hours=5, minutes=30))
+          now = datetime.now(timezone.utc).astimezone(ist)
+          target_hours = {8, 10, 12, 14, 16, 18, 20, 22}
+
+          if now.hour in target_hours:
+              slot_hour = now.hour
+          elif (now.hour - 1) in target_hours:
+              slot_hour = now.hour - 1
+          else:
+              with open(output, "a", encoding="utf-8") as f:
+                  f.write("due=false\n")
+                  f.write("slot=none\n")
+              print(f"No YouTube slot due now ({now:%Y-%m-%d %H:%M IST}).")
+              raise SystemExit(0)
+
+          slot = f"{now:%Y-%m-%d}-{slot_hour:02d}"
+          with open(output, "a", encoding="utf-8") as f:
+              f.write("due=true\n")
+              f.write(f"slot={slot}\n")
+          print(f"YouTube slot due: {slot}")
+          PY
+
       - name: Checkout repository
+        if: steps.slot.outputs.due == 'true'
         uses: actions/checkout@v4
 
+      - name: Check whether this slot already uploaded
+        id: slot_cache
+        if: steps.slot.outputs.due == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .youtube-slot-marker
+          key: youtube-slot-${{ steps.slot.outputs.slot }}
+
       - name: Set up Python
+        if: steps.slot.outputs.due == 'true' && steps.slot_cache.outputs.cache-hit != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
+        if: steps.slot.outputs.due == 'true' && steps.slot_cache.outputs.cache-hit != 'true'
         run: pip install -r requirements.txt
 
       - name: Run YouTube automation
+        id: run
+        if: steps.slot.outputs.due == 'true' && steps.slot_cache.outputs.cache-hit != 'true'
+        shell: bash
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
@@ -31,4 +98,30 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           READY_FOLDER_ID: ${{ secrets.READY_FOLDER_ID }}
           UPLOADED_FOLDER_ID: ${{ secrets.UPLOADED_FOLDER_ID }}
-        run: python main.py
+        run: |
+          set +e
+          python main.py 2>&1 | tee youtube_run.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          if grep -q "YouTube upload successful." youtube_run.log; then
+            echo "uploaded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "uploaded=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mark posting slot complete
+        if: steps.run.outputs.uploaded == 'true'
+        run: echo "${{ steps.slot.outputs.slot }}" > .youtube-slot-marker
+
+      - name: Save completed posting slot
+        if: steps.run.outputs.uploaded == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .youtube-slot-marker
+          key: youtube-slot-${{ steps.slot.outputs.slot }}
+
+      - name: Slot already completed
+        if: steps.slot.outputs.due == 'true' && steps.slot_cache.outputs.cache-hit == 'true'
+        run: echo "This YouTube posting slot already succeeded, so no duplicate Short will be uploaded."
