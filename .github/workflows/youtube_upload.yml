@@ -1,7 +1,6 @@
 name: YouTube Auto Upload
 
 on:
-  workflow_dispatch:
   schedule:
     # YouTube: ONLY 2 uploads/day — 2 PM and 8 PM IST.
     # GitHub cron uses UTC. Primary attempts are 08:30 and 14:30 UTC.
@@ -29,16 +28,6 @@ jobs:
           from datetime import datetime, timezone, timedelta
 
           output = os.environ["GITHUB_OUTPUT"]
-          event = os.environ.get("GITHUB_EVENT_NAME", "")
-          run_id = os.environ.get("GITHUB_RUN_ID", "manual")
-
-          if event == "workflow_dispatch":
-              with open(output, "a", encoding="utf-8") as f:
-                  f.write("due=true\n")
-                  f.write(f"slot=manual-{run_id}\n")
-              print("Manual YouTube upload allowed.")
-              raise SystemExit(0)
-
           ist = timezone(timedelta(hours=5, minutes=30))
           now = datetime.now(timezone.utc).astimezone(ist)
           target_hours = {14, 20}
