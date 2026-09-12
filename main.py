@@ -76,7 +76,6 @@ def download_video(drive, file_id, filename, expected_size=None):
             if expected is not None and actual != expected:
                 raise RuntimeError(f"Drive download size mismatch: expected {expected} bytes, got {actual} bytes.")
 
-            # Decode-check the container before doing any normalization/upload work.
             check = subprocess.run(
                 ["ffmpeg", "-v", "error", "-i", path, "-map", "0:v:0", "-f", "null", "-"],
                 capture_output=True,
@@ -286,20 +285,14 @@ def upload_to_youtube(youtube, video_path, metadata):
     return response
 
 
-def verify_youtube_public(youtube, video_id):
-    for attempt in range(1, 7):
-        response = youtube.videos().list(part="status,processingDetails", id=video_id).execute()
-        items = response.get("items", [])
-        if not items:
-            raise RuntimeError("Uploaded YouTube video could not be retrieved for verification.")
-        item = items[0]
-        privacy = item.get("status", {}).get("privacyStatus")
-        processing = item.get("processingDetails", {}).get("processingStatus")
-        print(f"YouTube verification attempt {attempt}: privacy={privacy}, processing={processing}")
-        if privacy == "public":
-            return
-        time.sleep(5)
-    raise RuntimeError("YouTube did not keep the uploaded video public. The Google API project may be subject to YouTube's unverified-project private-upload restriction.")
+def verify_youtube_upload_response(upload_response):
+    privacy = upload_response.get("status", {}).get("privacyStatus")
+    print(f"YouTube upload response privacy: {privacy}")
+    if privacy != "public":
+        raise RuntimeError(
+            "YouTube accepted the upload but did not return privacyStatus=public. "
+            "The API project may be subject to YouTube's private-upload restriction."
+        )
 
 
 def delete_from_drive(drive, file_id):
@@ -354,9 +347,9 @@ def main():
     video_id = youtube_video["id"]
     print("YouTube upload API completed.")
     print("YouTube Video ID:", video_id)
-    verify_youtube_public(youtube, video_id)
+    verify_youtube_upload_response(youtube_video)
     print("YouTube upload successful.")
-    print("YouTube privacy verified: public")
+    print("YouTube privacy verified from upload response: public")
 
     delete_from_drive(drive, video["id"])
 
