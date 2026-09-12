@@ -67,7 +67,7 @@ jobs:
           for attempt in 1 2 3; do
             echo "YouTube automation attempt ${attempt}/3"
             : > youtube_attempt.log
-            python main.py 2>&1 | tee youtube_attempt.log | tee -a youtube_run.log
+            python runner.py 2>&1 | tee youtube_attempt.log | tee -a youtube_run.log
             status=${PIPESTATUS[0]}
 
             if [ "$status" -eq 0 ]; then
